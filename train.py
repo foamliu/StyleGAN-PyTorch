@@ -7,7 +7,6 @@ from torch import nn, optim
 from torch.autograd import grad
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms, utils
 from tqdm import tqdm
 
@@ -48,10 +47,6 @@ def train_net(args):
     torch.manual_seed(7)
     np.random.seed(7)
     checkpoint = args.checkpoint
-    start_epoch = 0
-    best_loss = float('inf')
-    writer = SummaryWriter()
-    epochs_since_improvement = 0
 
     generator = nn.DataParallel(StyledGenerator(code_size)).cuda()
     discriminator = nn.DataParallel(
