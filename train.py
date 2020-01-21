@@ -13,7 +13,7 @@ from tqdm import tqdm
 from config import code_size, n_critic
 from data_gen import MultiResolutionDataset
 from models import StyledGenerator, Discriminator
-from utils import parse_args, get_logger
+from utils import parse_args
 
 
 def requires_grad(model, flag=True):
@@ -100,8 +100,6 @@ def train_net(args):
     args.gen_sample = {512: (8, 4), 1024: (4, 2)}
 
     args.batch_default = 32
-
-    logger = get_logger()
 
     step = int(math.log2(args.init_size)) - 2
     resolution = 4 * 2 ** step
