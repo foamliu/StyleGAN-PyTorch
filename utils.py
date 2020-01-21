@@ -84,15 +84,35 @@ def accuracy(scores, targets, k=1):
 def parse_args():
     parser = argparse.ArgumentParser(description='Train face network')
     # general
-    parser.add_argument('--end-epoch', type=int, default=1000, help='training epoch size.')
-    parser.add_argument('--lr', type=float, default=1e-5, help='start learning rate')
-    parser.add_argument('--lr-step', type=int, default=10, help='period of learning rate decay')
-    parser.add_argument('--optimizer', default='sgd', help='optimizer')
-    parser.add_argument('--weight-decay', type=float, default=1e-5, help='weight decay')
-    parser.add_argument('--mom', type=float, default=0.9, help='momentum')
-    parser.add_argument('--batch-size', type=int, default=64, help='batch size in each context')
-    parser.add_argument('--checkpoint', type=str, default=None, help='checkpoint')
-    parser.add_argument('--pretrained', type=bool, default=False, help='pretrained model')
+    parser.add_argument('path', type=str, help='path of specified dataset')
+    parser.add_argument(
+        '--phase',
+        type=int,
+        default=600_000,
+        help='number of samples used for each training phases',
+    )
+    parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
+    parser.add_argument('--sched', action='store_true', help='use lr scheduling')
+    parser.add_argument('--init_size', default=8, type=int, help='initial image size')
+    parser.add_argument('--max_size', default=1024, type=int, help='max image size')
+    parser.add_argument(
+        '--ckpt', default=None, type=str, help='load from previous checkpoints'
+    )
+    parser.add_argument(
+        '--no_from_rgb_activate',
+        action='store_true',
+        help='use activate in from_rgb (original implementation)',
+    )
+    parser.add_argument(
+        '--mixing', action='store_true', help='use mixing regularization'
+    )
+    parser.add_argument(
+        '--loss',
+        type=str,
+        default='wgan-gp',
+        choices=['wgan-gp', 'r1'],
+        help='class of gan loss',
+    )
     args = parser.parse_args()
     return args
 

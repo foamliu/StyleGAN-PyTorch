@@ -1,13 +1,47 @@
+import math
+import random
+
 import numpy as np
 import torch
-from torch import nn
+from torch import nn, optim
+from torch.autograd import grad
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms, utils
+from tqdm import tqdm
 
-from config import device, im_size, grad_clip, print_freq, num_workers
-from data_gen import DIMDataset
-from models.deeplab import DeepLab
-from utils import parse_args, save_checkpoint, AverageMeter, clip_gradient, get_logger, get_learning_rate, \
-    alpha_prediction_loss
+from config import code_size, n_critic
+from data_gen import MultiResolutionDataset
+from models import StyledGenerator, Discriminator
+from utils import parse_args, get_logger
+
+
+def requires_grad(model, flag=True):
+    for p in model.parameters():
+        p.requires_grad = flag
+
+
+def accumulate(model1, model2, decay=0.999):
+    par1 = dict(model1.named_parameters())
+    par2 = dict(model2.named_parameters())
+
+    for k in par1.keys():
+        par1[k
+        ].data.mul_(decay).add_(1 - decay, par2[k].data)
+
+
+def sample_data(dataset, batch_size, image_size=4):
+    dataset.resolution = image_size
+    loader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=1, drop_last=True)
+
+    return loader
+
+
+def adjust_lr(optimizer, lr):
+    for group in optimizer.param_groups:
+        mult = group.get('mult', 1)
+        group['lr'] = lr * mult
 
 
 def train_net(args):
@@ -19,142 +53,265 @@ def train_net(args):
     writer = SummaryWriter()
     epochs_since_improvement = 0
 
-    # Initialize / load checkpoint
-    if checkpoint is None:
-        model = DeepLab(backbone='mobilenet', output_stride=16, num_classes=1)
-        model = nn.DataParallel(model)
+    generator = nn.DataParallel(StyledGenerator(code_size)).cuda()
+    discriminator = nn.DataParallel(
+        Discriminator(from_rgb_activate=not args.no_from_rgb_activate)
+    ).cuda()
+    g_running = StyledGenerator(code_size).cuda()
+    g_running.train(False)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    g_optimizer = optim.Adam(
+        generator.module.generator.parameters(), lr=args.lr, betas=(0.0, 0.99)
+    )
+    g_optimizer.add_param_group(
+        {
+            'params': generator.module.style.parameters(),
+            'lr': args.lr * 0.01,
+            'mult': 0.01,
+        }
+    )
+    d_optimizer = optim.Adam(discriminator.parameters(), lr=args.lr, betas=(0.0, 0.99))
+
+    accumulate(g_running, generator.module, 0)
+
+    # Initialize / load checkpoint
+    if checkpoint is not None:
+        ckpt = torch.load(args.ckpt)
+
+        generator.module.load_state_dict(ckpt['generator'])
+        discriminator.module.load_state_dict(ckpt['discriminator'])
+        g_running.load_state_dict(ckpt['g_running'])
+        g_optimizer.load_state_dict(ckpt['g_optimizer'])
+        d_optimizer.load_state_dict(ckpt['d_optimizer'])
+
+    transform = transforms.Compose(
+        [
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+        ]
+    )
+
+    dataset = MultiResolutionDataset(args.path, transform)
+
+    if args.sched:
+        args.lr = {128: 0.0015, 256: 0.002, 512: 0.003, 1024: 0.003}
+        args.batch = {4: 512, 8: 256, 16: 128, 32: 64, 64: 32, 128: 32, 256: 32}
 
     else:
-        checkpoint = torch.load(checkpoint)
-        start_epoch = checkpoint['epoch'] + 1
-        epochs_since_improvement = checkpoint['epochs_since_improvement']
-        model = checkpoint['model']
-        optimizer = checkpoint['optimizer']
+        args.lr = {}
+        args.batch = {}
+
+    args.gen_sample = {512: (8, 4), 1024: (4, 2)}
+
+    args.batch_default = 32
 
     logger = get_logger()
 
-    # Move to GPU, if available
-    model = model.to(device)
+    step = int(math.log2(args.init_size)) - 2
+    resolution = 4 * 2 ** step
+    loader = sample_data(
+        dataset, args.batch.get(resolution, args.batch_default), resolution
+    )
+    data_loader = iter(loader)
 
-    # Custom dataloaders
-    train_dataset = DIMDataset('train')
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                               num_workers=num_workers)
-    valid_dataset = DIMDataset('valid')
-    valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False,
-                                               num_workers=num_workers)
+    adjust_lr(g_optimizer, args.lr.get(resolution, 0.001))
+    adjust_lr(d_optimizer, args.lr.get(resolution, 0.001))
 
-    # scheduler = MultiStepLR(optimizer, milestones=[10, 20], gamma=0.1)
+    pbar = tqdm(range(3_000_000))
 
-    # Epochs
-    for epoch in range(start_epoch, args.end_epoch):
-        # scheduler.step(epoch)
+    requires_grad(generator, False)
+    requires_grad(discriminator, True)
 
-        # One epoch's training
-        train_loss = train(train_loader=train_loader,
-                           model=model,
-                           optimizer=optimizer,
-                           epoch=epoch,
-                           logger=logger)
-        effective_lr = get_learning_rate(optimizer)
-        print('Current effective learning rate: {}\n'.format(effective_lr))
+    disc_loss_val = 0
+    gen_loss_val = 0
+    grad_loss_val = 0
 
-        writer.add_scalar('Train_Loss', train_loss, epoch)
+    alpha = 0
+    used_sample = 0
 
-        # One epoch's validation
-        valid_loss = valid(valid_loader=valid_loader,
-                           model=model,
-                           logger=logger)
+    max_step = int(math.log2(args.max_size)) - 2
+    final_progress = False
 
-        writer.add_scalar('Valid_Loss', valid_loss, epoch)
+    for i in pbar:
+        discriminator.zero_grad()
 
-        # Check if there was an improvement
-        is_best = valid_loss < best_loss
-        best_loss = min(valid_loss, best_loss)
-        if not is_best:
-            epochs_since_improvement += 1
-            print("\nEpochs since last improvement: %d\n" % (epochs_since_improvement,))
+        alpha = min(1, 1 / args.phase * (used_sample + 1))
+
+        if (resolution == args.init_size and args.ckpt is None) or final_progress:
+            alpha = 1
+
+        if used_sample > args.phase * 2:
+            used_sample = 0
+            step += 1
+
+            if step > max_step:
+                step = max_step
+                final_progress = True
+                ckpt_step = step + 1
+
+            else:
+                alpha = 0
+                ckpt_step = step
+
+            resolution = 4 * 2 ** step
+
+            loader = sample_data(
+                dataset, args.batch.get(resolution, args.batch_default), resolution
+            )
+            data_loader = iter(loader)
+
+            torch.save(
+                {
+                    'generator': generator.module.state_dict(),
+                    'discriminator': discriminator.module.state_dict(),
+                    'g_optimizer': g_optimizer.state_dict(),
+                    'd_optimizer': d_optimizer.state_dict(),
+                    'g_running': g_running.state_dict(),
+                },
+                f'checkpoint/train_step-{ckpt_step}.model',
+            )
+
+            adjust_lr(g_optimizer, args.lr.get(resolution, 0.001))
+            adjust_lr(d_optimizer, args.lr.get(resolution, 0.001))
+
+        try:
+            real_image = next(data_loader)
+
+        except (OSError, StopIteration):
+            data_loader = iter(loader)
+            real_image = next(data_loader)
+
+        used_sample += real_image.shape[0]
+
+        b_size = real_image.size(0)
+        real_image = real_image.cuda()
+
+        if args.loss == 'wgan-gp':
+            real_predict = discriminator(real_image, step=step, alpha=alpha)
+            real_predict = real_predict.mean() - 0.001 * (real_predict ** 2).mean()
+            (-real_predict).backward()
+
+        elif args.loss == 'r1':
+            real_image.requires_grad = True
+            real_scores = discriminator(real_image, step=step, alpha=alpha)
+            real_predict = F.softplus(-real_scores).mean()
+            real_predict.backward(retain_graph=True)
+
+            grad_real = grad(
+                outputs=real_scores.sum(), inputs=real_image, create_graph=True
+            )[0]
+            grad_penalty = (
+                    grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
+            ).mean()
+            grad_penalty = 10 / 2 * grad_penalty
+            grad_penalty.backward()
+            if i % 10 == 0:
+                grad_loss_val = grad_penalty.item()
+
+        if args.mixing and random.random() < 0.9:
+            gen_in11, gen_in12, gen_in21, gen_in22 = torch.randn(
+                4, b_size, code_size, device='cuda'
+            ).chunk(4, 0)
+            gen_in1 = [gen_in11.squeeze(0), gen_in12.squeeze(0)]
+            gen_in2 = [gen_in21.squeeze(0), gen_in22.squeeze(0)]
+
         else:
-            epochs_since_improvement = 0
+            gen_in1, gen_in2 = torch.randn(2, b_size, code_size, device='cuda').chunk(
+                2, 0
+            )
+            gen_in1 = gen_in1.squeeze(0)
+            gen_in2 = gen_in2.squeeze(0)
 
-        # Save checkpoint
-        save_checkpoint(epoch, epochs_since_improvement, model, optimizer, best_loss, is_best)
+        fake_image = generator(gen_in1, step=step, alpha=alpha)
+        fake_predict = discriminator(fake_image, step=step, alpha=alpha)
 
+        if args.loss == 'wgan-gp':
+            fake_predict = fake_predict.mean()
+            fake_predict.backward()
 
-def train(train_loader, model, optimizer, epoch, logger):
-    model.train()  # train mode (dropout and batchnorm is used)
+            eps = torch.rand(b_size, 1, 1, 1).cuda()
+            x_hat = eps * real_image.data + (1 - eps) * fake_image.data
+            x_hat.requires_grad = True
+            hat_predict = discriminator(x_hat, step=step, alpha=alpha)
+            grad_x_hat = grad(
+                outputs=hat_predict.sum(), inputs=x_hat, create_graph=True
+            )[0]
+            grad_penalty = (
+                    (grad_x_hat.view(grad_x_hat.size(0), -1).norm(2, dim=1) - 1) ** 2
+            ).mean()
+            grad_penalty = 10 * grad_penalty
+            grad_penalty.backward()
+            if i % 10 == 0:
+                grad_loss_val = grad_penalty.item()
+                disc_loss_val = (-real_predict + fake_predict).item()
 
-    losses = AverageMeter()
+        elif args.loss == 'r1':
+            fake_predict = F.softplus(fake_predict).mean()
+            fake_predict.backward()
+            if i % 10 == 0:
+                disc_loss_val = (real_predict + fake_predict).item()
 
-    # Batches
-    for i, (img, alpha_label) in enumerate(train_loader):
-        # Move to GPU, if available
-        img = img.type(torch.FloatTensor).to(device)  # [N, 4, 320, 320]
-        alpha_label = alpha_label.type(torch.FloatTensor).to(device)  # [N, 2, 320, 320]
-        alpha_label = alpha_label.reshape((-1, 2, im_size * im_size))  # [N, 2, 320*320]
+        d_optimizer.step()
 
-        # Forward prop.
-        alpha_out = model(img)  # [N, 320, 320]
-        alpha_out = alpha_out.reshape((-1, 1, im_size * im_size))  # [N, 320*320]
+        if (i + 1) % n_critic == 0:
+            generator.zero_grad()
 
-        # Calculate loss
-        # loss = criterion(alpha_out, alpha_label)
-        loss = alpha_prediction_loss(alpha_out, alpha_label)
+            requires_grad(generator, True)
+            requires_grad(discriminator, False)
 
-        # Back prop.
-        optimizer.zero_grad()
-        loss.backward()
+            fake_image = generator(gen_in2, step=step, alpha=alpha)
 
-        # Clip gradients
-        clip_gradient(optimizer, grad_clip)
+            predict = discriminator(fake_image, step=step, alpha=alpha)
 
-        # Update weights
-        optimizer.step()
+            if args.loss == 'wgan-gp':
+                loss = -predict.mean()
 
-        # Keep track of metrics
-        losses.update(loss.item())
+            elif args.loss == 'r1':
+                loss = F.softplus(-predict).mean()
 
-        # Print status
+            if i % 10 == 0:
+                gen_loss_val = loss.item()
 
-        if i % print_freq == 0:
-            status = 'Epoch: [{0}][{1}/{2}]\t' \
-                     'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(epoch, i, len(train_loader), loss=losses)
-            logger.info(status)
+            loss.backward()
+            g_optimizer.step()
+            accumulate(g_running, generator.module)
 
-    return losses.avg
+            requires_grad(generator, False)
+            requires_grad(discriminator, True)
 
+        if (i + 1) % 100 == 0:
+            images = []
 
-def valid(valid_loader, model, logger):
-    model.eval()  # eval mode (dropout and batchnorm is NOT used)
+            gen_i, gen_j = args.gen_sample.get(resolution, (10, 5))
 
-    losses = AverageMeter()
+            with torch.no_grad():
+                for _ in range(gen_i):
+                    images.append(
+                        g_running(
+                            torch.randn(gen_j, code_size).cuda(), step=step, alpha=alpha
+                        ).data.cpu()
+                    )
 
-    # Batches
-    for img, alpha_label in valid_loader:
-        # Move to GPU, if available
-        img = img.type(torch.FloatTensor).to(device)  # [N, 4, 320, 320]
-        alpha_label = alpha_label.type(torch.FloatTensor).to(device)  # [N, 2, 320, 320]
-        alpha_label = alpha_label.reshape((-1, 2, im_size * im_size))  # [N, 2, 320*320]
+            utils.save_image(
+                torch.cat(images, 0),
+                f'sample/{str(i + 1).zfill(6)}.png',
+                nrow=gen_i,
+                normalize=True,
+                range=(-1, 1),
+            )
 
-        # Forward prop.
-        alpha_out = model(img)  # [N, 320, 320]
-        alpha_out = alpha_out.reshape((-1, 1, im_size * im_size))  # [N, 320*320]
+        if (i + 1) % 10000 == 0:
+            torch.save(
+                g_running.state_dict(), f'checkpoint/{str(i + 1).zfill(6)}.model'
+            )
 
-        # Calculate loss
-        # loss = criterion(alpha_out, alpha_label)
-        loss = alpha_prediction_loss(alpha_out, alpha_label)
+        state_msg = (
+            f'Size: {4 * 2 ** step}; G: {gen_loss_val:.3f}; D: {disc_loss_val:.3f};'
+            f' Grad: {grad_loss_val:.3f}; Alpha: {alpha:.5f}'
+        )
 
-        # Keep track of metrics
-        losses.update(loss.item())
-
-    # Print status
-    status = 'Validation: Loss {loss.avg:.4f}\n'.format(loss=losses)
-
-    logger.info(status)
-
-    return losses.avg
+        pbar.set_description(state_msg)
 
 
 def main():
