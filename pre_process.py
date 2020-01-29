@@ -60,7 +60,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', type=str)
     parser.add_argument('--n_worker', type=int, default=8)
-    parser.add_argument('path', type=str)
+    parser.add_argument('--path', type=str)
 
     args = parser.parse_args()
 
@@ -69,3 +69,5 @@ if __name__ == '__main__':
     with lmdb.open(args.out, map_size=1024 ** 4, readahead=False) as env:
         with env.begin(write=True) as txn:
             prepare(txn, imgset, args.n_worker)
+
+    # python3 pre_process.py --path data/FFHQ/FFHQ --out data/lmdb
