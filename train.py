@@ -46,7 +46,6 @@ def adjust_lr(optimizer, lr):
 def train_net(args):
     torch.manual_seed(7)
     np.random.seed(7)
-    checkpoint = args.checkpoint
 
     generator = nn.DataParallel(StyledGenerator(code_size)).cuda()
     discriminator = nn.DataParallel(
@@ -316,4 +315,4 @@ def main():
 if __name__ == '__main__':
     main()
 
-    # python3 train.py --path data/FFHQ/FFHQ
+    # python3 train.py --path data/lmdb
