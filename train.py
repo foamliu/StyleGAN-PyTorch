@@ -69,7 +69,7 @@ def train_net(args):
     accumulate(g_running, generator.module, 0)
 
     # Initialize / load checkpoint
-    if checkpoint is not None:
+    if args.ckpt is not None:
         ckpt = torch.load(args.ckpt)
 
         generator.module.load_state_dict(ckpt['generator'])
