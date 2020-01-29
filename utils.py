@@ -6,7 +6,7 @@ import os
 def parse_args():
     parser = argparse.ArgumentParser(description='Train face network')
     # general
-    parser.add_argument('path', type=str, help='path of specified dataset')
+    parser.add_argument('--path', type=str, help='path of specified dataset')
     parser.add_argument(
         '--phase',
         type=int,

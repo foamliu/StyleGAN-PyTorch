@@ -315,3 +315,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+    # python3 train.py --path data/FFHQ/FFHQ
