@@ -70,4 +70,4 @@ if __name__ == '__main__':
         with env.begin(write=True) as txn:
             prepare(txn, imgset, args.n_worker)
 
-    # python3 pre_process.py --path data/FFHQ/FFHQ --out data/lmdb
+    # python3 pre_process.py --path data/FFHQ/ --out data/lmdb
